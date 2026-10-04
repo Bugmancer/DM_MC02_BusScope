@@ -1,0 +1,11 @@
+# Keil build output and local workspace state
+/MDK-ARM/DM_MC02_BusScope/
+/MDK-ARM/build.log
+/MDK-ARM/*.lst
+*.uvguix.*
+
+# Temporary and operating-system files
+*.bak
+*.tmp
+Thumbs.db
+.DS_Store
