@@ -49,7 +49,7 @@
 /* USER CODE END Variables */
 osThreadId defaultTaskHandle;
 osThreadId KeyTaskHandle;
-uint32_t KeyTaskBuffer[ 128 ];
+uint32_t KeyTaskBuffer[ 512 ];
 osStaticThreadDef_t KeyTaskControlBlock;
 osThreadId LcdTaskHandle;
 uint32_t LcdTaskBuffer[ 512 ];
@@ -139,7 +139,7 @@ void MX_FREERTOS_Init(void) {
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* definition and creation of KeyTask */
-  osThreadStaticDef(KeyTask, KeyTask_Entry, osPriorityAboveNormal, 0, 128, KeyTaskBuffer, &KeyTaskControlBlock);
+  osThreadStaticDef(KeyTask, KeyTask_Entry, osPriorityAboveNormal, 0, 512, KeyTaskBuffer, &KeyTaskControlBlock);
   KeyTaskHandle = osThreadCreate(osThread(KeyTask), NULL);
 
   /* definition and creation of LcdTask */

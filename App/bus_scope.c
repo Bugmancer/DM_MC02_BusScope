@@ -1,5 +1,6 @@
 #include "bus_scope.h"
 #include "bus_scope_signal.h"
+#include "bus_scope_output.h"
 
 #include "adc.h"
 #include "fdcan.h"
@@ -46,11 +47,6 @@
 #define SCOPE_TIME_LABEL_Y   225U
 #define SCOPE_TRACE_BYTES    ((SCOPE_W * SCOPE_H + 7U) / 8U)
 
-/* PE13(TIM1_CH3) 自测 PWM：调成低频，便于当前 2ms 采样节奏估算频率/占空比。 */
-#define TEST_PWM_PSC        (2400U - 1U)
-#define TEST_PWM_ARR        (10000U - 1U)
-#define TEST_PWM_CCR        5000U
-
 #define SCOPE_Y_SCALE_X10_MIN  1U
 #define SCOPE_Y_SCALE_X10_MAX  80U
 #define SCOPE_Y_SCALE_X10_INIT 10U
@@ -61,7 +57,8 @@
 typedef enum
 {
     PAGE_CAN = 0,
-    PAGE_SCOPE = 1
+    PAGE_SCOPE = 1,
+    PAGE_OUTPUT = 2
 } DisplayPage;
 
 typedef enum
@@ -121,7 +118,47 @@ static uint16_t s_scope_grid_row[SCOPE_H];
 static uint8_t s_scope_grid_column[SCOPE_W];
 static volatile uint8_t s_app_ready;
 static volatile uint8_t s_adc_ready;
-static volatile uint8_t s_pwm_ready;
+static BusScopeOutputConfig s_output;
+static BusScopeOutputField s_output_field;
+static uint32_t s_output_revision;
+static uint32_t s_output_drawn_revision;
+static uint8_t s_output_drawn_ready;
+
+static void output_snapshot(BusScopeOutputConfig *config, BusScopeOutputField *field, uint32_t *revision)
+{
+    taskENTER_CRITICAL();
+    *config = s_output;
+    if (field != NULL) *field = s_output_field;
+    if (revision != NULL) *revision = s_output_revision;
+    taskEXIT_CRITICAL();
+}
+
+static void output_key(KeyId key)
+{
+    BusScopeOutputConfig config;
+    if (key == KEY_UP || key == KEY_DOWN)
+    {
+        taskENTER_CRITICAL();
+        s_output_field = (BusScopeOutputField)(((unsigned)s_output_field +
+            (key == KEY_DOWN ? 1U : OUTPUT_FIELD_COUNT - 1U)) % OUTPUT_FIELD_COUNT);
+        s_output_revision++;
+        taskEXIT_CRITICAL();
+    }
+    else if (key == KEY_LEFT || key == KEY_RIGHT)
+    {
+        output_snapshot(&config, NULL, NULL);
+        BusScope_OutputAdjust(&config, s_output_field, key == KEY_RIGHT ? 1 : -1);
+        if (config.frequency_hz == s_output.frequency_hz &&
+            config.duty_permille == s_output.duty_permille && config.enabled == s_output.enabled &&
+            BusScope_OutputReady()) return;
+        /* Only this task applies edits; initialization finishes before keys are enabled. */
+        (void)BusScope_OutputApply(&config);
+        taskENTER_CRITICAL();
+        s_output = config;
+        s_output_revision++;
+        taskEXIT_CRITICAL();
+    }
+}
 
 static uint16_t adc_read(uint8_t channel)
 {
@@ -406,8 +443,15 @@ static uint16_t usb_format_status(char *report, size_t capacity)
             (state.last_flags & FDCAN_EXTENDED_ID) ? "EXT" : "STD")) return 0U;
     }
     if (!report_append(report, capacity, &used, "SYS,%u,%u,%lu,%lu\r\n",
-        (unsigned)s_adc_ready, (unsigned)s_pwm_ready,
+        (unsigned)s_adc_ready, (unsigned)BusScope_OutputReady(),
         (unsigned long)s_scope_dropped, (unsigned long)s_scope_late)) return 0U;
+    {
+        BusScopeOutputConfig config;
+        output_snapshot(&config, NULL, NULL);
+        if (!report_append(report, capacity, &used, "OUT,PWM,%lu,%u,%u,%u,%lu\r\n", (unsigned long)config.frequency_hz,
+            (unsigned)config.duty_permille, (unsigned)config.enabled,
+            (unsigned)BusScope_OutputReady(), (unsigned long)BusScope_OutputActualMillihz())) return 0U;
+    }
     return (uint16_t)used;
 }
 
@@ -423,6 +467,42 @@ static void draw_can_page_full(void)
     draw_header("DM-MC02 BusScope  CAN");
     LCD_ShowString(8, 218, (const uint8_t *)"OK:PAGE  USB:CDC", GRAYBLUE, BLACK, 16, 0);
     memset(s_can_draw_valid, 0, sizeof(s_can_draw_valid));
+}
+
+static void draw_output_page(void)
+{
+    BusScopeOutputConfig config;
+    BusScopeOutputField field;
+    uint32_t revision;
+    uint8_t ready = BusScope_OutputReady();
+    char line[40];
+    output_snapshot(&config, &field, &revision);
+    LCD_Fill(0, 0, LCD_W, LCD_H, BLACK);
+    draw_header("BusScope  PWM OUT  PE13");
+    for (uint8_t i = 0U; i < OUTPUT_FIELD_COUNT; i++)
+    {
+        switch ((BusScopeOutputField)i)
+        {
+        case OUTPUT_FIELD_FREQ:
+            snprintf(line, sizeof(line), "%c FREQ: %lu Hz", field == i ? '>' : ' ', (unsigned long)config.frequency_hz);
+            break;
+        case OUTPUT_FIELD_DUTY:
+            snprintf(line, sizeof(line), "%c DUTY: %u.%u%%", field == i ? '>' : ' ',
+                     (unsigned)(config.duty_permille / 10U), (unsigned)(config.duty_permille % 10U));
+            break;
+        default:
+            snprintf(line, sizeof(line), "%c OUTPUT: %s", field == i ? '>' : ' ',
+                !ready ? "ERROR" : config.enabled ? "ON" : "OFF");
+            break;
+        }
+        LCD_ShowString(6, (uint16_t)(38U + i * 30U), (const uint8_t *)line,
+                       field == i ? YELLOW : WHITE, BLACK, 16, 0);
+    }
+    LCD_ShowString(8, 166, (const uint8_t *)"DIRECT  0/3.3V", CYAN, BLACK, 16, 0);
+    LCD_ShowString(8, 190, (const uint8_t *)"UP/DN:FIELD  L/R:VALUE", GRAYBLUE, BLACK, 16, 0);
+    LCD_ShowString(8, 218, (const uint8_t *)"OK:PAGE", GRAYBLUE, BLACK, 16, 0);
+    s_output_drawn_revision = revision;
+    s_output_drawn_ready = ready;
 }
 
 static uint8_t can_row_changed(uint8_t index, const CanPortState *current)
@@ -757,15 +837,9 @@ void BusScope_Init(void)
         s_adc_ready = 1U;
     }
 
-    /* PE13 输出自测 PWM，短接到 PA0 后可直接验证示波器页面。 */
-    __HAL_TIM_SET_PRESCALER(&htim1, TEST_PWM_PSC);
-    __HAL_TIM_SET_AUTORELOAD(&htim1, TEST_PWM_ARR);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, TEST_PWM_CCR);
-    if (HAL_TIM_GenerateEvent(&htim1, TIM_EVENTSOURCE_UPDATE) == HAL_OK &&
-        HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3) == HAL_OK)
-    {
-        s_pwm_ready = 1U;
-    }
+    BusScope_OutputDefault(&s_output);
+    s_output_field = OUTPUT_FIELD_FREQ;
+    if (BusScope_OutputInit()) (void)BusScope_OutputApply(&s_output);
 
     for (uint8_t i = 0; i < CAN_PORTS; i++)
     {
@@ -802,8 +876,11 @@ void BusScope_KeyTask(void const *argument)
             stable_key = key;
             if (stable_key == KEY_SELECT)
             {
-                /* OK/SELECT 键切换 CAN 页面和示波器页面。 */
-                s_page = (s_page == PAGE_CAN) ? PAGE_SCOPE : PAGE_CAN;
+                s_page = (DisplayPage)(((unsigned)s_page + 1U) % 3U);
+            }
+            else if (s_page == PAGE_OUTPUT)
+            {
+                output_key(stable_key);
             }
             else if (stable_key == KEY_UP && s_page == PAGE_SCOPE)
             {
@@ -881,10 +958,11 @@ void BusScope_LcdTask(void const *argument)
             {
                 draw_can_page_full();
             }
-            else
+            else if (page == PAGE_SCOPE)
             {
                 draw_scope_page_full();
             }
+            else draw_output_page();
         }
 
         if (page == PAGE_CAN)
@@ -895,7 +973,7 @@ void BusScope_LcdTask(void const *argument)
             draw_can_row_if_changed(2, 156);
             osDelay(50);
         }
-        else
+        else if (page == PAGE_SCOPE)
         {
             if ((uint32_t)(HAL_GetTick() - last_scope) >= 80U)
             {
@@ -903,6 +981,15 @@ void BusScope_LcdTask(void const *argument)
                 draw_scope();
             }
             osDelay(20);
+        }
+        else
+        {
+            uint32_t revision;
+            BusScopeOutputConfig config;
+            output_snapshot(&config, NULL, &revision);
+            if (s_output_drawn_revision != revision || s_output_drawn_ready != BusScope_OutputReady())
+                draw_output_page();
+            osDelay(50);
         }
     }
 }

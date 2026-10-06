@@ -17,6 +17,17 @@
 #pragma GCC diagnostic pop
 
 static uint32_t test_tick;
+static uint8_t output_ready;
+static uint32_t output_apply_count;
+uint8_t BusScope_OutputInit(void) { return 1U; }
+uint8_t BusScope_OutputApply(const BusScopeOutputConfig *config)
+{
+    assert(BusScope_OutputValidate(config));
+    output_apply_count++;
+    return output_ready;
+}
+uint8_t BusScope_OutputReady(void) { return output_ready; }
+uint32_t BusScope_OutputActualMillihz(void) { return 10000U; }
 uint32_t test_critical_depth;
 static TestSCB test_scb;
 TestSCB *SCB = &test_scb;
@@ -140,23 +151,24 @@ void LCD_ShowString(uint16_t x, uint16_t y, const uint8_t *text,
 {
     size_t length = strlen((const char *)text);
     LcdText *record;
-    assert(size == 12U && mode == 0U);
+    uint16_t width = size / 2U;
+    assert((size == 12U || size == 16U) && mode == 0U);
     assert(lcd_text_count < sizeof(lcd_text) / sizeof(lcd_text[0]));
     assert(length < sizeof(lcd_text[0].text));
-    assert(x + length * 6U <= LCD_W && y + size <= LCD_H);
+    assert(x + length * width <= LCD_W && y + size <= LCD_H);
     if (y >= 34U) lcd_axis_text_count++;
     record = &lcd_text[lcd_text_count++];
-    *record = (LcdText){x, y, (uint16_t)(length * 6U), size, {0}};
+    *record = (LcdText){x, y, (uint16_t)(length * width), size, {0}};
     memcpy(record->text, text, length + 1U);
     for (size_t i = 0U; i < length; i++)
     {
         assert(text[i] >= ' ' && text[i] <= '~');
         for (uint16_t row = 0U; row < size; row++)
         {
-            uint8_t bits = ascii_1206[text[i] - ' '][row];
-            for (uint16_t col = 0U; col < 6U; col++)
+            uint8_t bits = size == 12U ? ascii_1206[text[i] - ' '][row] : ascii_1608[text[i] - ' '][row];
+            for (uint16_t col = 0U; col < width; col++)
             {
-                record_lcd_write((uint16_t)(x + i * 6U + col), (uint16_t)(y + row),
+                record_lcd_write((uint16_t)(x + i * width + col), (uint16_t)(y + row),
                                  (bits & (1U << col)) ? foreground : background);
             }
         }
@@ -213,7 +225,11 @@ static void reset_state(void)
     test_tick = 0U;
     test_critical_depth = 0U;
     s_adc_ready = 0U;
-    s_pwm_ready = 0U;
+    output_ready = 0U;
+    output_apply_count = 0U;
+    BusScope_OutputDefault(&s_output);
+    s_output_field = OUTPUT_FIELD_FREQ;
+    s_output_revision = 0U;
     s_scope_dropped = 0U;
     s_scope_late = 0U;
     s_scope_ready = -1;
@@ -307,7 +323,7 @@ static void populate_largest_report(void)
     }
     test_tick = UINT32_MAX;
     s_adc_ready = 1U;
-    s_pwm_ready = 1U;
+    output_ready = 1U;
     s_scope_dropped = UINT32_MAX;
     s_scope_late = UINT32_MAX;
 }
@@ -344,7 +360,7 @@ static void test_full_can_fd_report(void)
         assert(strncmp(line, expected_line, used) == 0);
         line += used;
     }
-    assert(strcmp(line, "SYS,1,1,4294967295,4294967295\r\n") == 0);
+    assert(strcmp(line, "SYS,1,1,4294967295,4294967295\r\nOUT,PWM,10,500,1,1,10000\r\n") == 0);
 
     /* Every insufficient capacity must fail without writing beyond its bound. */
     for (size_t capacity = 0U; capacity <= length; capacity++)
@@ -475,14 +491,14 @@ static const LcdText *find_lcd_text(const char *text, uint16_t y)
     return NULL;
 }
 
-static void assert_lcd_labels_fit(void)
+static void assert_label_layout(uint8_t scope)
 {
     for (size_t i = 0U; i < lcd_text_count; i++)
     {
         const LcdText *a = &lcd_text[i];
         assert(a->x + a->width <= LCD_W && a->y + a->height <= LCD_H);
-        assert(a->x + a->width <= SCOPE_X || a->x >= SCOPE_X + SCOPE_W ||
-               a->y + a->height <= SCOPE_Y || a->y >= SCOPE_Y + SCOPE_H);
+        if (scope) assert(a->x + a->width <= SCOPE_X || a->x >= SCOPE_X + SCOPE_W ||
+                          a->y + a->height <= SCOPE_Y || a->y >= SCOPE_Y + SCOPE_H);
         for (size_t j = i + 1U; j < lcd_text_count; j++)
         {
             const LcdText *b = &lcd_text[j];
@@ -491,6 +507,8 @@ static void assert_lcd_labels_fit(void)
         }
     }
 }
+
+static void assert_lcd_labels_fit(void) { assert_label_layout(1U); }
 
 static void assert_voltage_labels(const char *const expected[5])
 {
@@ -844,6 +862,44 @@ static void test_scope_grid_preservation(void)
     }
 }
 
+static void test_output_page_and_keys(void)
+{
+    char report[USB_REPORT_SIZE];
+    reset_state();
+    output_ready = 1U;
+    reset_lcd_capture();
+    draw_output_page();
+    assert_label_layout(0U);
+    assert(find_lcd_text("> FREQ: 10 Hz", 38U) != NULL);
+    output_key(KEY_UP);
+    assert(s_output_field == OUTPUT_FIELD_ENABLE);
+    output_key(KEY_LEFT);
+    assert(s_output.enabled == 0U && output_apply_count == 1U);
+    output_key(KEY_RIGHT);
+    assert(s_output.enabled == 1U && output_apply_count == 2U);
+    output_key(KEY_RIGHT);
+    assert(output_apply_count == 2U);
+    output_key(KEY_DOWN);
+    assert(s_output_field == OUTPUT_FIELD_FREQ);
+    output_key(KEY_RIGHT);
+    assert(s_output.frequency_hz == 20U);
+    output_key(KEY_DOWN);
+    output_key(KEY_RIGHT);
+    assert(s_output.duty_permille == 510U);
+    reset_lcd_capture();
+    draw_output_page();
+    assert_label_layout(0U);
+    assert(find_lcd_text("> DUTY: 51.0%", 68U) != NULL);
+    assert(find_lcd_text("DIRECT  0/3.3V", 166U) != NULL);
+    output_ready = 0U;
+    reset_lcd_capture();
+    draw_output_page();
+    assert(find_lcd_text("  OUTPUT: ERROR", 98U) != NULL);
+    assert(usb_format_status(report, sizeof(report)) != 0U);
+    assert(strstr(report, "OUT,PWM,20,510,1,0,10000\r\n") != NULL);
+    assert(test_critical_depth == 0U);
+}
+
 int main(int argc, char **argv)
 {
     preview_prefix = (argc > 1) ? argv[1] : NULL;
@@ -856,6 +912,7 @@ int main(int argc, char **argv)
     test_scope_complete_frame_and_clipping();
     test_scope_axis_refresh();
     test_scope_grid_preservation();
+    test_output_page_and_keys();
     puts("bus_scope_app: all tests passed");
     return 0;
 }

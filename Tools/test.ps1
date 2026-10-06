@@ -15,6 +15,18 @@ $OutputDirectory = (Resolve-Path -LiteralPath $OutputDirectory).Path
 
 $cases = @(
     @{
+        Name = 'output-hardware'
+        Sources = @('Tests/output_hw/test_bus_scope_output_hw.c', 'App/bus_scope_output.c')
+        Includes = @('Tests/output_hw/stubs', 'App/Inc')
+        Flags = @('-pedantic')
+    },
+    @{
+        Name = 'output'
+        Sources = @('App/bus_scope_output.c', 'Tests/test_bus_scope_output.c')
+        Includes = @('App/Inc')
+        Flags = @('-Wconversion', '-pedantic')
+    },
+    @{
         Name = 'signal'
         Sources = @('App/bus_scope_signal.c', 'Tests/test_bus_scope_signal.c')
         Includes = @('App/Inc')
@@ -28,7 +40,7 @@ $cases = @(
     },
     @{
         Name = 'app'
-        Sources = @('Tests/app/test_bus_scope_app.c', 'App/bus_scope_signal.c')
+        Sources = @('Tests/app/test_bus_scope_app.c', 'App/bus_scope_signal.c', 'App/bus_scope_output.c')
         Includes = @('Tests/app/stubs', 'App/Inc')
         # LTO discards uncalled hardware functions from the production source.
         Flags = @('-O2', '-flto', '-ffunction-sections', '-fdata-sections', '-Wl,--gc-sections')
