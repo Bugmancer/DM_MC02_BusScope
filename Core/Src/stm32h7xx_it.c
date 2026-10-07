@@ -22,6 +22,8 @@
 #include "stm32h7xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "adc.h"
+#include "bus_scope_output.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -366,5 +368,15 @@ void TIM23_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+
+void ADC_IRQHandler(void)
+{
+  HAL_ADC_IRQHandler(&hadc1);
+}
+
+void TIM1_UP_IRQHandler(void)
+{
+  BusScope_OutputUpdateIRQ();
+}
 
 /* USER CODE END 1 */

@@ -55,7 +55,7 @@ osThreadId LcdTaskHandle;
 uint32_t LcdTaskBuffer[ 512 ];
 osStaticThreadDef_t LcdTaskControlBlock;
 osThreadId ImuTaskHandle;
-uint32_t ImuTaskBuffer[ 256 ];
+uint32_t ImuTaskBuffer[ 512 ];
 osStaticThreadDef_t ImuTaskControlBlock;
 osThreadId FunTestHandle;
 uint32_t FunTestBuffer[ 512 ];
@@ -147,7 +147,7 @@ void MX_FREERTOS_Init(void) {
   LcdTaskHandle = osThreadCreate(osThread(LcdTask), NULL);
 
   /* definition and creation of ImuTask */
-  osThreadStaticDef(ImuTask, ImuTask_Entry, osPriorityRealtime, 0, 256, ImuTaskBuffer, &ImuTaskControlBlock);
+  osThreadStaticDef(ImuTask, ImuTask_Entry, osPriorityRealtime, 0, 512, ImuTaskBuffer, &ImuTaskControlBlock);
   ImuTaskHandle = osThreadCreate(osThread(ImuTask), NULL);
 
   /* definition and creation of FunTest */

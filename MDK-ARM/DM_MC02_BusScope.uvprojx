@@ -475,6 +475,16 @@
               <FilePath>../App/bus_scope_signal.c</FilePath>
             </File>
             <File>
+              <FileName>bus_scope_capture.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/bus_scope_capture.c</FilePath>
+            </File>
+            <File>
+              <FileName>bus_scope_acquisition.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/bus_scope_acquisition.c</FilePath>
+            </File>
+            <File>
               <FileName>bus_scope_output.c</FileName>
               <FileType>1</FileType>
               <FilePath>../App/bus_scope_output.c</FilePath>

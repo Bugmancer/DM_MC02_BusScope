@@ -1,5 +1,5 @@
-; STM32H723: DMA1 cannot access DTCM. Keep the ADC cache line in SRAM1.
-; BusScope_Init enables SRAM1 and initializes ADC_DMA before starting DMA.
+; STM32H723: DMA1 cannot access DTCM. Keep the ADC circular buffer in SRAM1.
+; BusScope_AcquisitionInit enables SRAM1 and initializes ADC_DMA before DMA.
 LR_IROM1 0x08000000 0x00100000 {
   ER_IROM1 0x08000000 0x00100000 {
     *.o (RESET, +First)
@@ -7,7 +7,7 @@ LR_IROM1 0x08000000 0x00100000 {
     .ANY (+RO)
     .ANY (+XO)
   }
-  RW_ADC_DMA 0x30000000 UNINIT 0x00000020 {
+  RW_ADC_DMA 0x30000000 UNINIT 0x00001000 {
     *.o (ADC_DMA)
   }
   RW_IRAM1 0x20000000 0x00020000 {

@@ -1,6 +1,8 @@
 #include "bus_scope.h"
 #include "bus_scope_signal.h"
 #include "bus_scope_output.h"
+#include "bus_scope_capture.h"
+#include "bus_scope_acquisition.h"
 
 #include "adc.h"
 #include "fdcan.h"
@@ -14,9 +16,6 @@
 #include <stdio.h>
 #include <string.h>
 
-#define ADC_CH_SCOPE        0U
-#define ADC_CH_KEY          1U
-#define ADC_DMA_CHANNELS    2U
 #define CAN_PORTS           3U
 #define CAN_RX_BUDGET       32U
 #define USB_REPORT_MS       500U
@@ -33,14 +32,12 @@
 #define KEY_TOLERANCE       1000U
 #define KEY_NONE_MIN        60000U
 
-#define SCOPE_SAMPLES       272U
-#define SCOPE_SAMPLE_MS     2U
+#define SCOPE_SAMPLES       BUS_SCOPE_CAPTURE_SAMPLES
 #define SCOPE_X             44U
 #define SCOPE_Y             56U
 #define SCOPE_W             232U
 #define SCOPE_H             161U
-#define SCOPE_SPAN_MS       ((SCOPE_SAMPLES - 1U) * SCOPE_SAMPLE_MS)
-#define SCOPE_TIME_TICK_MS   100U
+#define SCOPE_TIME_DIVISIONS 4U
 #define SCOPE_Y_DIVISIONS    4U
 #define SCOPE_AXIS_FONT      12U
 #define SCOPE_AXIS_CHAR_W    (SCOPE_AXIS_FONT / 2U)
@@ -50,7 +47,7 @@
 #define SCOPE_Y_SCALE_X10_MIN  1U
 #define SCOPE_Y_SCALE_X10_MAX  80U
 #define SCOPE_Y_SCALE_X10_INIT 10U
-#define SCOPE_Y_OFFSET_MV_STEP 1000
+#define SCOPE_Y_OFFSET_MV_STEP 100
 #define SCOPE_Y_OFFSET_MV_MIN  (-10000)
 #define SCOPE_Y_OFFSET_MV_MAX  10000
 
@@ -89,16 +86,35 @@ typedef struct
     uint8_t bus_off;
 } CanPortState;
 
-/* A private cache line in DMA-accessible SRAM1; see MDK-ARM/BusScope.sct. */
-#if defined(__CC_ARM)
-static volatile uint16_t s_adc_dma[16] __attribute__((section("ADC_DMA"), zero_init, aligned(32)));
-#else
-static volatile uint16_t s_adc_dma[16] __attribute__((section("ADC_DMA"), aligned(32)));
-#endif
-static uint16_t s_scope[2][SCOPE_SAMPLES];
-static volatile int8_t s_scope_ready = -1;
+typedef enum
+{
+    SCOPE_FIELD_TIME = 0, SCOPE_FIELD_MODE, SCOPE_FIELD_EDGE,
+    SCOPE_FIELD_LEVEL, SCOPE_FIELD_SCALE, SCOPE_FIELD_OFFSET,
+    SCOPE_FIELD_ARM, SCOPE_FIELD_COUNT
+} ScopeField;
+
+static const uint16_t s_scope_decimations[] = {1U, 2U, 5U, 10U, 20U, 50U, 100U, 200U};
+static const char * const s_scope_modes[] = {"AUTO", "NORMAL", "SINGLE", "HOLD"};
+static BusScopeCapture s_capture;
+static BusScopeCaptureConfig s_scope_config = {5U, 1650U, 0U, BUS_SCOPE_CAPTURE_AUTO};
+static BusScopeCaptureFrame s_scope_frame;
+static BusScopeCaptureFrame s_scope_display;
+static volatile uint8_t s_scope_ready;
+static uint8_t s_scope_display_valid;
+static volatile uint8_t s_scope_stopped;
+static volatile uint8_t s_scope_waiting = 1U;
+static ScopeField s_scope_field;
+static uint32_t s_scope_revision;
+static uint32_t s_scope_applied_revision;
+static uint32_t s_scope_frame_revision;
+static uint32_t s_scope_display_revision;
+static uint32_t s_scope_period_us = 50U;
+static uint32_t s_scope_axes_period_us;
+static uint16_t s_scope_marker_x;
+static uint8_t s_scope_marker_valid;
+static char s_scope_drawn_lines[3][48];
+static uint16_t s_scope_drawn_colors[3];
 static volatile uint32_t s_scope_dropped;
-static volatile uint32_t s_scope_late;
 static CanPortState s_can[CAN_PORTS];
 /* 记录 LCD 上一次已经画出来的 CAN 状态，只在内容变化时刷新对应行。 */
 static CanPortState s_can_drawn[CAN_PORTS];
@@ -118,16 +134,17 @@ static uint16_t s_scope_grid_row[SCOPE_H];
 static uint8_t s_scope_grid_column[SCOPE_W];
 static volatile uint8_t s_app_ready;
 static volatile uint8_t s_adc_ready;
-static BusScopeOutputConfig s_output;
 static BusScopeOutputField s_output_field;
 static uint32_t s_output_revision;
 static uint32_t s_output_drawn_revision;
-static uint8_t s_output_drawn_ready;
+static uint32_t s_output_drawn_status_revision;
+static char s_output_drawn_lines[7][48];
+static uint16_t s_output_drawn_colors[7];
 
-static void output_snapshot(BusScopeOutputConfig *config, BusScopeOutputField *field, uint32_t *revision)
+static void output_snapshot(BusScopeOutputStatus *status, BusScopeOutputField *field, uint32_t *revision)
 {
     taskENTER_CRITICAL();
-    *config = s_output;
+    BusScope_OutputSnapshot(status);
     if (field != NULL) *field = s_output_field;
     if (revision != NULL) *revision = s_output_revision;
     taskEXIT_CRITICAL();
@@ -135,6 +152,7 @@ static void output_snapshot(BusScopeOutputConfig *config, BusScopeOutputField *f
 
 static void output_key(KeyId key)
 {
+    BusScopeOutputStatus status;
     BusScopeOutputConfig config;
     if (key == KEY_UP || key == KEY_DOWN)
     {
@@ -146,27 +164,16 @@ static void output_key(KeyId key)
     }
     else if (key == KEY_LEFT || key == KEY_RIGHT)
     {
-        output_snapshot(&config, NULL, NULL);
+        output_snapshot(&status, NULL, NULL);
+        config = status.requested;
         BusScope_OutputAdjust(&config, s_output_field, key == KEY_RIGHT ? 1 : -1);
-        if (config.frequency_hz == s_output.frequency_hz &&
-            config.duty_permille == s_output.duty_permille && config.enabled == s_output.enabled &&
-            BusScope_OutputReady()) return;
+        if (config.frequency_hz == status.requested.frequency_hz &&
+            config.frequency_step_hz == status.requested.frequency_step_hz &&
+            config.duty_permille == status.requested.duty_permille && config.enabled == status.requested.enabled &&
+            status.ready && status.error == OUTPUT_ERROR_NONE) return;
         /* Only this task applies edits; initialization finishes before keys are enabled. */
         (void)BusScope_OutputApply(&config);
-        taskENTER_CRITICAL();
-        s_output = config;
-        s_output_revision++;
-        taskEXIT_CRITICAL();
     }
-}
-
-static uint16_t adc_read(uint8_t channel)
-{
-    if ((SCB->CCR & SCB_CCR_DC_Msk) != 0U)
-    {
-        SCB_InvalidateDCache_by_Addr((uint32_t *)(void *)s_adc_dma, sizeof(s_adc_dma));
-    }
-    return s_adc_dma[channel];
 }
 
 static void can_snapshot(uint8_t index, CanPortState *state)
@@ -184,7 +191,7 @@ static uint16_t abs_diff_u16(uint16_t a, uint16_t b)
 
 static KeyId read_key(void)
 {
-    uint16_t adc = adc_read(ADC_CH_KEY);
+    uint16_t adc = BusScope_AcquisitionKeyRaw();
 
     /* 没按键时 ADC 接近满量程；按键按下后落到各自的分压区间。 */
     if (adc >= KEY_NONE_MIN)
@@ -248,9 +255,71 @@ static uint8_t scope_raw_to_y(uint16_t raw, uint8_t scale_x10, int16_t offset_mv
     return scope_mv_to_y((int32_t)adc_to_mv(raw), scale_x10, offset_mv, y_out);
 }
 
-static uint16_t scope_time_to_x(uint32_t time_ms)
+static uint16_t scope_sample_to_x(uint32_t index)
 {
-    return (uint16_t)(SCOPE_X + (time_ms * (SCOPE_W - 1U) + SCOPE_SPAN_MS / 2U) / SCOPE_SPAN_MS);
+    return (uint16_t)(SCOPE_X + (index * (SCOPE_W - 1U) + (SCOPE_SAMPLES - 1U) / 2U) /
+                      (SCOPE_SAMPLES - 1U));
+}
+
+static void scope_key(KeyId key)
+{
+    uint8_t changed = 0U;
+    int direction = key == KEY_RIGHT ? 1 : -1;
+    taskENTER_CRITICAL();
+    if (key == KEY_UP || key == KEY_DOWN)
+    {
+        s_scope_field = (ScopeField)(((unsigned)s_scope_field +
+            (key == KEY_DOWN ? 1U : SCOPE_FIELD_COUNT - 1U)) % SCOPE_FIELD_COUNT);
+    }
+    else if (key == KEY_LEFT || key == KEY_RIGHT)
+    {
+        switch (s_scope_field)
+        {
+        case SCOPE_FIELD_TIME:
+            for (unsigned i = 0U; i < sizeof(s_scope_decimations) / sizeof(s_scope_decimations[0]); i++)
+            {
+                if (s_scope_config.decimation != s_scope_decimations[i]) continue;
+                if (direction > 0 && i + 1U < sizeof(s_scope_decimations) / sizeof(s_scope_decimations[0]))
+                    s_scope_config.decimation = s_scope_decimations[i + 1U];
+                else if (direction < 0 && i > 0U) s_scope_config.decimation = s_scope_decimations[i - 1U];
+                changed = 1U;
+                break;
+            }
+            break;
+        case SCOPE_FIELD_MODE:
+            s_scope_config.mode = (BusScopeCaptureMode)(((unsigned)s_scope_config.mode +
+                (direction > 0 ? 1U : 3U)) % 4U);
+            changed = 1U;
+            break;
+        case SCOPE_FIELD_EDGE:
+            s_scope_config.falling = (uint8_t)(direction < 0);
+            changed = 1U;
+            break;
+        case SCOPE_FIELD_LEVEL:
+            if (direction > 0 && s_scope_config.trigger_mv < 3250U) s_scope_config.trigger_mv += 50U;
+            if (direction < 0 && s_scope_config.trigger_mv > 50U) s_scope_config.trigger_mv -= 50U;
+            changed = 1U;
+            break;
+        case SCOPE_FIELD_SCALE:
+            if (direction > 0 && s_scope_y_scale_pending_x10 < SCOPE_Y_SCALE_X10_MAX) s_scope_y_scale_pending_x10++;
+            if (direction < 0 && s_scope_y_scale_pending_x10 > SCOPE_Y_SCALE_X10_MIN) s_scope_y_scale_pending_x10--;
+            break;
+        case SCOPE_FIELD_OFFSET:
+            if (direction > 0 && s_scope_y_offset_pending_mv < SCOPE_Y_OFFSET_MV_MAX)
+                s_scope_y_offset_pending_mv += SCOPE_Y_OFFSET_MV_STEP;
+            if (direction < 0 && s_scope_y_offset_pending_mv > SCOPE_Y_OFFSET_MV_MIN)
+                s_scope_y_offset_pending_mv -= SCOPE_Y_OFFSET_MV_STEP;
+            break;
+        case SCOPE_FIELD_ARM:
+            if (direction < 0) s_scope_config.mode = BUS_SCOPE_CAPTURE_HOLD;
+            else if (s_scope_config.mode == BUS_SCOPE_CAPTURE_HOLD) s_scope_config.mode = BUS_SCOPE_CAPTURE_SINGLE;
+            changed = 1U;
+            break;
+        default: break;
+        }
+        if (changed) s_scope_revision++;
+    }
+    taskEXIT_CRITICAL();
 }
 
 static int32_t scope_tick_mv(uint8_t tick, uint8_t scale_x10, int16_t offset_mv)
@@ -417,6 +486,25 @@ static uint16_t usb_format_status(char *report, size_t capacity)
 {
     size_t used = 0U;
     uint32_t now = HAL_GetTick();
+    BusScopeOutputStatus output;
+    BusScopeAcquisitionStatus acquisition;
+    BusScopeCaptureStats stats;
+    BusScopeCaptureConfig config;
+    uint32_t sequence, period_us, dropped;
+    uint8_t waiting, stopped, valid;
+    BusScope_OutputSnapshot(&output);
+    BusScope_AcquisitionSnapshot(&acquisition);
+    taskENTER_CRITICAL();
+    stats = s_scope_frame.stats;
+    sequence = s_scope_frame.sequence;
+    period_us = s_scope_frame.period_us;
+    config = s_scope_config;
+    dropped = s_scope_dropped;
+    waiting = s_scope_waiting;
+    stopped = s_scope_stopped;
+    valid = sequence != 0U && (s_scope_frame_revision == s_scope_revision ||
+        config.mode == BUS_SCOPE_CAPTURE_HOLD);
+    taskEXIT_CRITICAL();
     for (uint8_t i = 0; i < CAN_PORTS; i++)
     {
         CanPortState state;
@@ -443,14 +531,31 @@ static uint16_t usb_format_status(char *report, size_t capacity)
             (state.last_flags & FDCAN_EXTENDED_ID) ? "EXT" : "STD")) return 0U;
     }
     if (!report_append(report, capacity, &used, "SYS,%u,%u,%lu,%lu\r\n",
-        (unsigned)s_adc_ready, (unsigned)BusScope_OutputReady(),
-        (unsigned long)s_scope_dropped, (unsigned long)s_scope_late)) return 0U;
+        (unsigned)acquisition.running, (unsigned)output.ready,
+        (unsigned long)dropped, (unsigned long)acquisition.lost_blocks)) return 0U;
+    if (!report_append(report, capacity, &used,
+        "SCOPE,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%lu,%u,%u,%u,%u\r\n",
+        (unsigned long)sequence, (unsigned long)BUS_SCOPE_ADC_RATE_HZ, (unsigned long)period_us,
+        (unsigned)config.mode, (unsigned)config.falling, (unsigned)config.trigger_mv,
+        (unsigned)waiting, (unsigned)stopped, (unsigned)stats.min_mv, (unsigned)stats.max_mv,
+        (unsigned)stats.vpp_mv, (unsigned)stats.mean_mv, (unsigned)stats.rms_mv,
+        (unsigned long)stats.freq_millihz, (unsigned)stats.duty_permille,
+        (unsigned)stats.frequency_valid, (unsigned)stats.undersampled, (unsigned)valid)) return 0U;
+    if (!report_append(report, capacity, &used, "ADCSTAT,%lu,%lu,%lu,%lu,%lu\r\n",
+        (unsigned long)acquisition.blocks, (unsigned long)acquisition.lost_blocks,
+        (unsigned long)acquisition.errors, (unsigned long)acquisition.restarts,
+        (unsigned long)acquisition.last_error)) return 0U;
     {
-        BusScopeOutputConfig config;
-        output_snapshot(&config, NULL, NULL);
-        if (!report_append(report, capacity, &used, "OUT,PWM,%lu,%u,%u,%u,%lu\r\n", (unsigned long)config.frequency_hz,
-            (unsigned)config.duty_permille, (unsigned)config.enabled,
-            (unsigned)BusScope_OutputReady(), (unsigned long)BusScope_OutputActualMillihz())) return 0U;
+        if (!report_append(report, capacity, &used, "OUT,PWM,%lu,%u,%u,%u,%lu\r\n",
+            (unsigned long)output.requested.frequency_hz, (unsigned)output.requested.duty_permille,
+            (unsigned)output.requested.enabled, (unsigned)output.ready,
+            (unsigned long)output.timing.actual_millihz)) return 0U;
+        if (!report_append(report, capacity, &used, "OUTSTAT,%u,%lu,%u,%u,%u,%u,%lu,%u,%lu\r\n",
+            (unsigned)output.pending, (unsigned long)output.applied.frequency_hz,
+            (unsigned)output.applied.duty_permille, (unsigned)output.applied.enabled,
+            (unsigned)output.timing.prescaler, (unsigned)output.timing.autoreload,
+            (unsigned long)output.timing.compare, (unsigned)output.error,
+            (unsigned long)output.failures)) return 0U;
     }
     return (uint16_t)used;
 }
@@ -469,40 +574,66 @@ static void draw_can_page_full(void)
     memset(s_can_draw_valid, 0, sizeof(s_can_draw_valid));
 }
 
-static void draw_output_page(void)
+static void draw_output_line(uint8_t row, uint16_t y, uint8_t font, const char *line, uint16_t color, uint8_t full)
 {
-    BusScopeOutputConfig config;
+    if (full || strcmp(s_output_drawn_lines[row], line) != 0 || s_output_drawn_colors[row] != color)
+    {
+        LCD_Fill(6, y, LCD_W, (uint16_t)(y + font), BLACK);
+        LCD_ShowString(6, y, (const uint8_t *)line, color, BLACK, font, 0);
+        snprintf(s_output_drawn_lines[row], sizeof(s_output_drawn_lines[row]), "%s", line);
+        s_output_drawn_colors[row] = color;
+    }
+}
+
+static void draw_output_page(uint8_t full)
+{
+    BusScopeOutputStatus status;
     BusScopeOutputField field;
     uint32_t revision;
-    uint8_t ready = BusScope_OutputReady();
-    char line[40];
-    output_snapshot(&config, &field, &revision);
-    LCD_Fill(0, 0, LCD_W, LCD_H, BLACK);
-    draw_header("BusScope  PWM OUT  PE13");
+    uint32_t duty_millipercent;
+    char line[48];
+    output_snapshot(&status, &field, &revision);
+    if (full)
+    {
+        LCD_Fill(0, 0, LCD_W, LCD_H, BLACK);
+        draw_header("BusScope  PWM OUT  PE13");
+    }
     for (uint8_t i = 0U; i < OUTPUT_FIELD_COUNT; i++)
     {
         switch ((BusScopeOutputField)i)
         {
         case OUTPUT_FIELD_FREQ:
-            snprintf(line, sizeof(line), "%c FREQ: %lu Hz", field == i ? '>' : ' ', (unsigned long)config.frequency_hz);
+            snprintf(line, sizeof(line), "%c FREQ: %lu Hz", field == i ? '>' : ' ', (unsigned long)status.requested.frequency_hz);
+            break;
+        case OUTPUT_FIELD_STEP:
+            snprintf(line, sizeof(line), "%c STEP: %lu Hz", field == i ? '>' : ' ', (unsigned long)status.requested.frequency_step_hz);
             break;
         case OUTPUT_FIELD_DUTY:
             snprintf(line, sizeof(line), "%c DUTY: %u.%u%%", field == i ? '>' : ' ',
-                     (unsigned)(config.duty_permille / 10U), (unsigned)(config.duty_permille % 10U));
+                     (unsigned)(status.requested.duty_permille / 10U), (unsigned)(status.requested.duty_permille % 10U));
             break;
         default:
             snprintf(line, sizeof(line), "%c OUTPUT: %s", field == i ? '>' : ' ',
-                !ready ? "ERROR" : config.enabled ? "ON" : "OFF");
+                !status.ready ? "ERROR" : status.pending ? "ON (PENDING)" : status.applied.enabled ? "ON" : "OFF");
             break;
         }
-        LCD_ShowString(6, (uint16_t)(38U + i * 30U), (const uint8_t *)line,
-                       field == i ? YELLOW : WHITE, BLACK, 16, 0);
+        draw_output_line(i, (uint16_t)(36U + i * 28U), 16U, line, field == i ? YELLOW : WHITE, full);
     }
-    LCD_ShowString(8, 166, (const uint8_t *)"DIRECT  0/3.3V", CYAN, BLACK, 16, 0);
-    LCD_ShowString(8, 190, (const uint8_t *)"UP/DN:FIELD  L/R:VALUE", GRAYBLUE, BLACK, 16, 0);
-    LCD_ShowString(8, 218, (const uint8_t *)"OK:PAGE", GRAYBLUE, BLACK, 16, 0);
+    duty_millipercent = status.applied.enabled ?
+        (uint32_t)(((uint64_t)status.timing.compare * 100000U + (status.timing.autoreload + 1U) / 2U) /
+        (status.timing.autoreload + 1U)) : 0U;
+    snprintf(line, sizeof(line), "ACT:%lu.%03luHz D:%lu.%03lu%%",
+        (unsigned long)(status.timing.actual_millihz / 1000U),
+        (unsigned long)(status.timing.actual_millihz % 1000U),
+        (unsigned long)(duty_millipercent / 1000U), (unsigned long)(duty_millipercent % 1000U));
+    draw_output_line(4U, 158U, 12U, line, CYAN, full);
+    snprintf(line, sizeof(line), "PSC:%u ARR:%u CCR:%lu", (unsigned)status.timing.prescaler,
+        (unsigned)status.timing.autoreload, (unsigned long)status.timing.compare);
+    draw_output_line(5U, 180U, 12U, line, GRAYBLUE, full);
+    snprintf(line, sizeof(line), "0/3.3V  ERR:%u  FAIL:%lu", (unsigned)status.error, (unsigned long)status.failures);
+    draw_output_line(6U, 210U, 12U, line, status.error == OUTPUT_ERROR_NONE ? GRAYBLUE : RED, full);
     s_output_drawn_revision = revision;
-    s_output_drawn_ready = ready;
+    s_output_drawn_status_revision = status.revision;
 }
 
 static uint8_t can_row_changed(uint8_t index, const CanPortState *current)
@@ -596,9 +727,9 @@ static void draw_scope_grid(uint8_t scale_x10, int16_t offset_mv)
         s_scope_grid_row[y - SCOPE_Y] = DARKBLUE;
         LCD_Fill(SCOPE_X, y, SCOPE_X + SCOPE_W, y + 1U, DARKBLUE);
     }
-    for (uint32_t time_ms = 0U; time_ms <= SCOPE_SPAN_MS; time_ms += SCOPE_TIME_TICK_MS)
+    for (uint32_t tick = 0U; tick <= SCOPE_TIME_DIVISIONS; tick++)
     {
-        uint16_t x = scope_time_to_x(time_ms);
+        uint16_t x = scope_sample_to_x(tick * (SCOPE_SAMPLES - 1U) / SCOPE_TIME_DIVISIONS);
         s_scope_grid_column[x - SCOPE_X] = 1U;
         LCD_Fill(x, SCOPE_Y, x + 1U, SCOPE_Y + SCOPE_H, DARKBLUE);
     }
@@ -615,10 +746,7 @@ static void draw_scope_axes(uint8_t scale_x10, int16_t offset_mv)
 
     /* Clear labels too: changing scale/offset can shorten signs and digits. */
     LCD_Fill(0, 34U, LCD_W, LCD_H, BLACK);
-    LCD_ShowString(6U, 36U, (const uint8_t *)"V", GRAYBLUE, BLACK, SCOPE_AXIS_FONT, 0);
-    (void)snprintf(label, sizeof(label), "T:%lums", (unsigned long)SCOPE_SPAN_MS);
-    LCD_ShowString((uint16_t)(SCOPE_X + SCOPE_W - strlen(label) * SCOPE_AXIS_CHAR_W), 36U,
-                   (const uint8_t *)label, GRAYBLUE, BLACK, SCOPE_AXIS_FONT, 0);
+    s_scope_drawn_lines[2][0] = '\0';
     LCD_ShowString(2U, SCOPE_TIME_LABEL_Y, (const uint8_t *)"t(ms)",
                    GRAYBLUE, BLACK, SCOPE_AXIS_FONT, 0);
 
@@ -633,13 +761,20 @@ static void draw_scope_axes(uint8_t scale_x10, int16_t offset_mv)
         LCD_Fill(SCOPE_X - 4U, y, SCOPE_X, y + 1U, GRAYBLUE);
     }
 
-    for (uint32_t time_ms = 0U; time_ms <= SCOPE_SPAN_MS; time_ms += SCOPE_TIME_TICK_MS)
+    for (uint32_t tick = 0U; tick <= SCOPE_TIME_DIVISIONS; tick++)
     {
-        uint16_t x = scope_time_to_x(time_ms);
+        uint32_t index = tick * (SCOPE_SAMPLES - 1U) / SCOPE_TIME_DIVISIONS;
+        uint16_t x = scope_sample_to_x(index);
         uint16_t width;
-        (void)snprintf(label, sizeof(label), "%lu", (unsigned long)time_ms);
+        uint16_t label_x;
+        uint32_t centims = (index * s_scope_period_us + 5U) / 10U;
+        (void)snprintf(label, sizeof(label), "%lu.%02lu", (unsigned long)(centims / 100U),
+                       (unsigned long)(centims % 100U));
         width = (uint16_t)(strlen(label) * SCOPE_AXIS_CHAR_W);
-        LCD_ShowString(x - width / 2U, SCOPE_TIME_LABEL_Y, (const uint8_t *)label,
+        label_x = (uint16_t)(x - width / 2U);
+        if (label_x < SCOPE_X) label_x = SCOPE_X;
+        if (label_x + width > LCD_W) label_x = (uint16_t)(LCD_W - width);
+        LCD_ShowString(label_x, SCOPE_TIME_LABEL_Y, (const uint8_t *)label,
                        GRAYBLUE, BLACK, SCOPE_AXIS_FONT, 0);
         LCD_Fill(x, SCOPE_Y + SCOPE_H, x + 1U, SCOPE_Y + SCOPE_H + 4U, GRAYBLUE);
     }
@@ -652,6 +787,8 @@ static void draw_scope_axes(uint8_t scale_x10, int16_t offset_mv)
     memset(s_scope_trace_drawn, 0, sizeof(s_scope_trace_drawn));
     s_scope_axes_scale_x10 = scale_x10;
     s_scope_axes_offset_mv = offset_mv;
+    s_scope_axes_period_us = s_scope_period_us;
+    s_scope_marker_valid = 0U;
     s_scope_axes_valid = 1U;
 }
 
@@ -664,6 +801,7 @@ static void draw_scope_page_full(void)
     offset_mv = s_scope_y_offset_pending_mv;
     taskEXIT_CRITICAL();
     LCD_Fill(0, 0, LCD_W, LCD_H, BLACK);
+    memset(s_scope_drawn_lines, 0, sizeof(s_scope_drawn_lines));
     draw_scope_axes(scale_x10, offset_mv);
 }
 
@@ -701,18 +839,18 @@ static void scope_trace_line(uint8_t *mask, uint16_t x1, uint16_t y1, uint16_t x
     }
 }
 
-static void draw_scope_trace(const uint16_t *frame, uint8_t scale_x10, int16_t offset_mv)
+static void draw_scope_trace(const BusScopeCaptureFrame *frame, uint8_t scale_x10, int16_t offset_mv)
 {
     uint16_t prev_y;
     uint16_t prev_x = SCOPE_X;
     uint8_t prev_valid;
     memset(s_scope_trace_next, 0, sizeof(s_scope_trace_next));
-    prev_valid = scope_raw_to_y(frame[0], scale_x10, offset_mv, &prev_y);
+    prev_valid = scope_raw_to_y(frame->samples[0], scale_x10, offset_mv, &prev_y);
     for (uint16_t i = 1U; i < SCOPE_SAMPLES; i++)
     {
         uint16_t y;
-        uint16_t x = scope_time_to_x((uint32_t)i * SCOPE_SAMPLE_MS);
-        uint8_t valid = scope_raw_to_y(frame[i], scale_x10, offset_mv, &y);
+        uint16_t x = scope_sample_to_x(i);
+        uint8_t valid = scope_raw_to_y(frame->samples[i], scale_x10, offset_mv, &y);
         if (prev_valid != 0U || valid != 0U || prev_y != y)
         {
             scope_trace_line(s_scope_trace_next, prev_x, prev_y, x, y);
@@ -722,6 +860,16 @@ static void draw_scope_trace(const uint16_t *frame, uint8_t scale_x10, int16_t o
         prev_valid = valid;
     }
     if (prev_valid != 0U) scope_trace_pixel(s_scope_trace_next, prev_x, prev_y);
+
+    for (uint16_t i = 0U; i < SCOPE_SAMPLES; i++)
+    {
+        uint16_t low_y, high_y;
+        uint16_t x = scope_sample_to_x(i);
+        uint8_t low_valid = scope_raw_to_y(frame->min[i], scale_x10, offset_mv, &low_y);
+        uint8_t high_valid = scope_raw_to_y(frame->max[i], scale_x10, offset_mv, &high_y);
+        if (low_valid || high_valid || low_y != high_y)
+            scope_trace_line(s_scope_trace_next, x, high_y, x, low_y);
+    }
 
     /* Update only the symmetric difference; restore covered grid pixels directly. */
     for (uint32_t byte = 0U; byte < SCOPE_TRACE_BYTES; byte++)
@@ -748,98 +896,136 @@ static void draw_scope_trace(const uint16_t *frame, uint8_t scale_x10, int16_t o
 
 static void draw_scope(void)
 {
-    static uint16_t frame[SCOPE_SAMPLES];
-    BusScopePwmMeasure pwm;
+    BusScopeCaptureConfig config;
+    BusScopeAcquisitionStatus acquisition;
+    ScopeField field;
     uint8_t y_scale_x10;
     int16_t y_offset_mv;
-    uint16_t min = 0xffffU;
-    uint16_t max = 0U;
-    char line[64];
+    uint8_t waiting, stopped, valid;
+    uint32_t revision;
+    char lines[3][48];
+    uint16_t colors[3] = {CYAN, WHITE, YELLOW};
+    const char *state;
 
     taskENTER_CRITICAL();
-    if (s_scope_ready < 0)
+    if (s_scope_ready || (s_scope_config.mode == BUS_SCOPE_CAPTURE_HOLD &&
+        !s_scope_display_valid && s_scope_frame.sequence != 0U))
     {
-        taskEXIT_CRITICAL();
-        return;
+        s_scope_display = s_scope_frame;
+        s_scope_display_revision = s_scope_frame_revision;
+        s_scope_display_valid = 1U;
+        s_scope_ready = 0U;
     }
-
-    memcpy(frame, s_scope[(uint8_t)s_scope_ready], sizeof(frame));
-    s_scope_ready = -1;
+    config = s_scope_config;
+    field = s_scope_field;
+    revision = s_scope_revision;
+    waiting = s_scope_waiting;
+    stopped = s_scope_stopped;
     y_scale_x10 = s_scope_y_scale_pending_x10;
     y_offset_mv = s_scope_y_offset_pending_mv;
     taskEXIT_CRITICAL();
-
-    for (uint16_t i = 0; i < SCOPE_SAMPLES; i++)
-    {
-        uint16_t v = frame[i];
-        if (v < min) min = v;
-        if (v > max) max = v;
-    }
-    BusScope_MeasurePwm(frame, SCOPE_SAMPLES, SCOPE_SAMPLE_MS * 1000U, &pwm);
-
-    LCD_Fill(0, 0, LCD_W, 34U, BLACK);
-    snprintf(line, sizeof(line), "V:%4lumV  MIN:%4lumV  MAX:%4lumV",
-             (unsigned long)adc_to_mv(frame[SCOPE_SAMPLES - 1U]),
-             (unsigned long)adc_to_mv(min),
-             (unsigned long)adc_to_mv(max));
-    LCD_ShowString(6, 4, (const uint8_t *)line, WHITE, BLACK, 12, 0);
-    if (pwm.valid != 0U)
-    {
-        snprintf(line, sizeof(line), "PWM:%3luHz DUTY:%2lu.%1lu%% Y:%u.%ux O:%+ldV",
-                 (unsigned long)pwm.freq_hz,
-                 (unsigned long)(pwm.duty_permille / 10U),
-                 (unsigned long)(pwm.duty_permille % 10U),
-                 (unsigned)(y_scale_x10 / 10U),
-                 (unsigned)(y_scale_x10 % 10U),
-                 (long)(y_offset_mv / 1000));
-    }
-    else
-    {
-        snprintf(line, sizeof(line), "PWM:--Hz DUTY:--.-%% Y:%u.%ux O:%+ldV",
-                 (unsigned)(y_scale_x10 / 10U),
-                 (unsigned)(y_scale_x10 % 10U),
-                 (long)(y_offset_mv / 1000));
-    }
-    LCD_ShowString(6, 22, (const uint8_t *)line, CYAN, BLACK, 12, 0);
-
+    BusScope_AcquisitionSnapshot(&acquisition);
+    valid = s_scope_display_valid &&
+        (s_scope_display_revision == revision || config.mode == BUS_SCOPE_CAPTURE_HOLD);
+    s_scope_period_us = valid ? s_scope_display.period_us :
+        (uint32_t)config.decimation * BUS_SCOPE_ADC_PERIOD_US;
     if (s_scope_axes_valid == 0U || s_scope_axes_scale_x10 != y_scale_x10 ||
-        s_scope_axes_offset_mv != y_offset_mv)
+        s_scope_axes_offset_mv != y_offset_mv || s_scope_axes_period_us != s_scope_period_us ||
+        (!valid && s_scope_display_valid))
     {
         draw_scope_axes(y_scale_x10, y_offset_mv);
     }
-    draw_scope_trace(frame, y_scale_x10, y_offset_mv);
+    if (valid) draw_scope_trace(&s_scope_display, y_scale_x10, y_offset_mv);
+    else if (s_scope_display_valid)
+    {
+        /* An old acquisition must not appear under newly selected timing. */
+        s_scope_display_valid = 0U;
+    }
+    state = !acquisition.running ? "ADC!" : config.mode == BUS_SCOPE_CAPTURE_HOLD ? "HOLD" :
+        stopped ? "DONE" : !valid ? "WAIT" :
+        config.mode == BUS_SCOPE_CAPTURE_AUTO ? (s_scope_display.triggered ? "TRIG" : "AUTO") :
+        waiting ? "WAIT" : "TRIG";
+    if (!acquisition.running) colors[0] = RED;
+    if (valid && s_scope_display.stats.frequency_valid)
+    {
+        snprintf(lines[0], sizeof(lines[0]), "%s 100k F:%lu.%luHz D:%u.%u%%", state,
+            (unsigned long)(s_scope_display.stats.freq_millihz / 1000U),
+            (unsigned long)((s_scope_display.stats.freq_millihz % 1000U) / 100U),
+            (unsigned)(s_scope_display.stats.duty_permille / 10U),
+            (unsigned)(s_scope_display.stats.duty_permille % 10U));
+    }
+    else snprintf(lines[0], sizeof(lines[0]), "%s 100k F:-- D:--%s", state,
+        valid && s_scope_display.stats.undersampled ? " UNDERSAMP" : "");
+    if (valid) snprintf(lines[1], sizeof(lines[1]), "PP:%umV RMS:%umV AVG:%umV",
+        (unsigned)s_scope_display.stats.vpp_mv, (unsigned)s_scope_display.stats.rms_mv,
+        (unsigned)s_scope_display.stats.mean_mv);
+    else snprintf(lines[1], sizeof(lines[1]), "PP:--mV RMS:--mV AVG:--mV");
+    switch (field)
+    {
+    case SCOPE_FIELD_TIME:
+    {
+        uint32_t div_us = (SCOPE_SAMPLES - 1U) * (uint32_t)config.decimation * BUS_SCOPE_ADC_PERIOD_US / SCOPE_TIME_DIVISIONS;
+        snprintf(lines[2], sizeof(lines[2]), "> TIME:%lu.%03lums/div  %s",
+            (unsigned long)(div_us / 1000U), (unsigned long)(div_us % 1000U), s_scope_modes[config.mode]);
+        break;
+    }
+    case SCOPE_FIELD_MODE:
+        snprintf(lines[2], sizeof(lines[2]), "> MODE:%s", s_scope_modes[config.mode]); break;
+    case SCOPE_FIELD_EDGE:
+        snprintf(lines[2], sizeof(lines[2]), "> EDGE:%s", config.falling ? "FALLING" : "RISING"); break;
+    case SCOPE_FIELD_LEVEL:
+        snprintf(lines[2], sizeof(lines[2]), "> TRIGGER:%umV", (unsigned)config.trigger_mv); break;
+    case SCOPE_FIELD_SCALE:
+        snprintf(lines[2], sizeof(lines[2]), "> Y GAIN:%u.%ux", (unsigned)(y_scale_x10 / 10U), (unsigned)(y_scale_x10 % 10U)); break;
+    case SCOPE_FIELD_OFFSET:
+        snprintf(lines[2], sizeof(lines[2]), "> Y OFFSET:%+ldmV", (long)y_offset_mv); break;
+    default:
+        snprintf(lines[2], sizeof(lines[2]), "> ARM:%s  LOST:%lu", s_scope_modes[config.mode],
+            (unsigned long)acquisition.lost_blocks); break;
+    }
+    for (uint8_t row = 0U; row < 3U; row++)
+    {
+        const uint16_t y[] = {4U, 22U, 36U};
+        if (strcmp(s_scope_drawn_lines[row], lines[row]) != 0 || s_scope_drawn_colors[row] != colors[row])
+        {
+            LCD_Fill(0U, y[row], LCD_W, y[row] + 12U, BLACK);
+            LCD_ShowString(6U, y[row], (const uint8_t *)lines[row], colors[row], BLACK, 12U, 0U);
+            memcpy(s_scope_drawn_lines[row], lines[row], sizeof(lines[row]));
+            s_scope_drawn_colors[row] = colors[row];
+        }
+    }
+    {
+        uint8_t marker = valid && s_scope_display.triggered;
+        uint16_t x = marker ? scope_sample_to_x(s_scope_display.trigger_index) : 0U;
+        if (marker != s_scope_marker_valid || (marker && x != s_scope_marker_x))
+        {
+            if (s_scope_marker_valid)
+                LCD_Fill(s_scope_marker_x, SCOPE_Y - 5U, s_scope_marker_x + 1U, SCOPE_Y - 1U, BLACK);
+            if (marker) LCD_Fill(x, SCOPE_Y - 5U, x + 1U, SCOPE_Y - 1U, YELLOW);
+            s_scope_marker_valid = marker;
+            s_scope_marker_x = x;
+        }
+    }
 }
 
 void BusScope_Init(void)
 {
     FDCAN_HandleTypeDef *ports[CAN_PORTS] = {&hfdcan1, &hfdcan2, &hfdcan3};
+    BusScopeOutputConfig output;
     if (s_app_ready != 0U) return;
 
-    __HAL_RCC_D2SRAM1_CLK_ENABLE();
-    memset((void *)s_adc_dma, 0, sizeof(s_adc_dma));
-    if ((SCB->CCR & SCB_CCR_DC_Msk) != 0U)
-    {
-        SCB_CleanInvalidateDCache_by_Addr((uint32_t *)(void *)s_adc_dma, sizeof(s_adc_dma));
-    }
-    memset(s_scope, 0, sizeof(s_scope));
-    s_scope_ready = -1;
+    BusScope_AcquisitionInit();
+    BusScopeCapture_Init(&s_capture);
+    s_scope_config = s_capture.config;
+    s_scope_ready = 0U;
     memset(s_can, 0, sizeof(s_can));
     memset(s_can_drawn, 0, sizeof(s_can_drawn));
     memset(s_can_draw_valid, 0, sizeof(s_can_draw_valid));
     memset((void *)s_can_lost_events, 0, sizeof(s_can_lost_events));
 
-    /* ADC1 双通道 DMA：PA0 是示波器输入，PA5 是 LCD 按键输入。 */
-    if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED) == HAL_OK &&
-        HAL_ADC_Start_DMA(&hadc1, (uint32_t *)(void *)s_adc_dma, ADC_DMA_CHANNELS) == HAL_OK)
-    {
-        /* Only DMA errors need an IRQ; tasks read the latest conversion. */
-        __HAL_DMA_DISABLE_IT(hadc1.DMA_Handle, DMA_IT_HT | DMA_IT_TC);
-        s_adc_ready = 1U;
-    }
-
-    BusScope_OutputDefault(&s_output);
+    BusScope_OutputDefault(&output);
     s_output_field = OUTPUT_FIELD_FREQ;
-    if (BusScope_OutputInit()) (void)BusScope_OutputApply(&s_output);
+    if (BusScope_OutputInit()) (void)BusScope_OutputApply(&output);
 
     for (uint8_t i = 0; i < CAN_PORTS; i++)
     {
@@ -882,54 +1068,7 @@ void BusScope_KeyTask(void const *argument)
             {
                 output_key(stable_key);
             }
-            else if (stable_key == KEY_UP && s_page == PAGE_SCOPE)
-            {
-                uint8_t scale = s_scope_y_scale_pending_x10;
-                if (scale < SCOPE_Y_SCALE_X10_MAX)
-                {
-                    scale++;
-                }
-                else
-                {
-                    scale = SCOPE_Y_SCALE_X10_MAX;
-                }
-                s_scope_y_scale_pending_x10 = scale;
-            }
-            else if (stable_key == KEY_DOWN && s_page == PAGE_SCOPE)
-            {
-                uint8_t scale = s_scope_y_scale_pending_x10;
-                if (scale > SCOPE_Y_SCALE_X10_MIN)
-                {
-                    scale--;
-                }
-                s_scope_y_scale_pending_x10 = scale;
-            }
-            else if (stable_key == KEY_LEFT && s_page == PAGE_SCOPE)
-            {
-                int16_t offset = s_scope_y_offset_pending_mv;
-                if (offset <= (SCOPE_Y_OFFSET_MV_MAX - SCOPE_Y_OFFSET_MV_STEP))
-                {
-                    offset += SCOPE_Y_OFFSET_MV_STEP;
-                }
-                else
-                {
-                    offset = SCOPE_Y_OFFSET_MV_MAX;
-                }
-                s_scope_y_offset_pending_mv = offset;
-            }
-            else if (stable_key == KEY_RIGHT && s_page == PAGE_SCOPE)
-            {
-                int16_t offset = s_scope_y_offset_pending_mv;
-                if (offset >= (SCOPE_Y_OFFSET_MV_MIN + SCOPE_Y_OFFSET_MV_STEP))
-                {
-                    offset -= SCOPE_Y_OFFSET_MV_STEP;
-                }
-                else
-                {
-                    offset = SCOPE_Y_OFFSET_MV_MIN;
-                }
-                s_scope_y_offset_pending_mv = offset;
-            }
+            else if (s_page == PAGE_SCOPE) scope_key(stable_key);
         }
         osDelay(20);
     }
@@ -962,7 +1101,7 @@ void BusScope_LcdTask(void const *argument)
             {
                 draw_scope_page_full();
             }
-            else draw_output_page();
+            else draw_output_page(1U);
         }
 
         if (page == PAGE_CAN)
@@ -985,10 +1124,10 @@ void BusScope_LcdTask(void const *argument)
         else
         {
             uint32_t revision;
-            BusScopeOutputConfig config;
-            output_snapshot(&config, NULL, &revision);
-            if (s_output_drawn_revision != revision || s_output_drawn_ready != BusScope_OutputReady())
-                draw_output_page();
+            BusScopeOutputStatus status;
+            output_snapshot(&status, NULL, &revision);
+            if (s_output_drawn_revision != revision || s_output_drawn_status_revision != status.revision)
+                draw_output_page(0U);
             osDelay(50);
         }
     }
@@ -1029,42 +1168,52 @@ void BusScope_CanTask(void const *argument)
 
 void BusScope_SampleTask(void const *argument)
 {
-    uint16_t pos = 0U;
-    uint8_t write_index = 0U;
-    TickType_t wake;
-    TickType_t previous;
-    const TickType_t period = pdMS_TO_TICKS(SCOPE_SAMPLE_MS);
+    static uint16_t block[BUS_SCOPE_ADC_BLOCK_SAMPLES];
+    static BusScopeCaptureFrame completed;
+    uint32_t engine_dropped = 0U;
     (void)argument;
     while (!s_app_ready) osDelay(10);
-    configASSERT(period > 0U);
-    wake = xTaskGetTickCount();
-    previous = wake - period;
+    (void)BusScope_AcquisitionStart();
 
     for (;;)
     {
-        TickType_t now = xTaskGetTickCount();
-        if ((TickType_t)(now - previous) != period)
+        BusScopeCaptureConfig config;
+        BusScopeAcquisitionStatus status;
+        uint32_t revision;
+        uint8_t gap = 0U;
+        taskENTER_CRITICAL();
+        config = s_scope_config;
+        revision = s_scope_revision;
+        taskEXIT_CRITICAL();
+        if (revision != s_scope_applied_revision)
         {
-            /* Discard uneven frames instead of reporting an incorrect frequency. */
-            pos = 0U;
-            s_scope_late++;
-            wake = now;
+            BusScopeCapture_Configure(&s_capture, &config);
+            s_scope_applied_revision = revision;
         }
-        previous = now;
-        if (s_adc_ready)
+        if (BusScope_AcquisitionReadBlock(block, &gap))
         {
-            s_scope[write_index][pos++] = adc_read(ADC_CH_SCOPE);
-            if (pos == SCOPE_SAMPLES)
-            {
-                taskENTER_CRITICAL();
-                if (s_scope_ready >= 0) s_scope_dropped++;
-                s_scope_ready = (int8_t)write_index;
-                write_index ^= 1U;
-                taskEXIT_CRITICAL();
-                pos = 0U;
-            }
+            if (gap) BusScopeCapture_Gap(&s_capture);
+            BusScopeCapture_Feed(&s_capture, block, BUS_SCOPE_ADC_BLOCK_SAMPLES);
         }
-        vTaskDelayUntil(&wake, period);
+        else if (gap) BusScopeCapture_Gap(&s_capture);
+        BusScope_AcquisitionSnapshot(&status);
+        if (BusScopeCapture_TakeFrame(&s_capture, &completed))
+        {
+            taskENTER_CRITICAL();
+            if (s_scope_ready) s_scope_dropped++;
+            s_scope_frame = completed;
+            s_scope_frame_revision = revision;
+            s_scope_ready = 1U;
+            taskEXIT_CRITICAL();
+        }
+        taskENTER_CRITICAL();
+        s_scope_dropped += s_capture.frames_dropped - engine_dropped;
+        engine_dropped = s_capture.frames_dropped;
+        s_scope_stopped = s_capture.stopped;
+        s_scope_waiting = s_capture.waiting;
+        s_adc_ready = status.running;
+        taskEXIT_CRITICAL();
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10U));
     }
 }
 
@@ -1110,11 +1259,6 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
         vTaskNotifyGiveFromISR(s_can_task, &wake);
         portYIELD_FROM_ISR(wake);
     }
-}
-
-void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
-{
-    if (hadc == &hadc1) s_adc_ready = 0U;
 }
 
 void KeyTask_Entry(void const *argument)
